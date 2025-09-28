@@ -130,28 +130,22 @@ static bool diffusion_step_callback(int32_t             step,
 
     callback_data * data = static_cast<callback_data *>(user_data);
 
-    auto print_progress_bar = [](int32_t step, int32_t total_steps) {
-        int progress_percent = (step * 100) / total_steps;
-        int progress_bars    = (step * 50) / total_steps;
-        fprintf(stderr, "\rdiffusion step: %d/%d [%s%s] %d%%",
-                step,
-                total_steps,
-                std::string(progress_bars, '=').c_str(),
-                std::string(50 - progress_bars, ' ').c_str(),
-                progress_percent);
-        fflush(stderr);  // Ensure immediate output
-    };
-
+    // Clear screen and redraw everything each time to avoid cursor position issues
+    printf("\r\033[2J\033[H");  // Clear screen and move cursor to top-left
+    
+    // Print progress bar
+    int progress_percent = (step * 100) / total_steps;
+    int progress_bars    = (step * 50) / total_steps;
+    printf("diffusion step: %d/%d [%s%s] %d%%\n",
+            step,
+            total_steps,
+            std::string(progress_bars, '=').c_str(),
+            std::string(50 - progress_bars, ' ').c_str(),
+            progress_percent);
+    
+    // Print current content if in visual mode
     if (data->diff_params->visual_mode) {
-        // Visual mode: clear
-        LOG_INF("\033[2J\033[H");  // Clear screen and move cursor to top-left
-
-        print_progress_bar(step, total_steps);
-
-        LOG_INF("\n");
-
-        std::string current_text = " ";
-
+        std::string current_text = "";
         for (int32_t i = data->n_input; i < n_tokens; i++) {
             std::string token_str;
             if (tokens[i] != llama_vocab_mask(data->vocab)) {
@@ -162,21 +156,14 @@ static bool diffusion_step_callback(int32_t             step,
                     token_str      = piece;
                 }
             } else {
-                token_str = " ";
+                token_str = "_";  // Use underscore for mask tokens to show progress
             }
-
             current_text += token_str;
         }
-
-        LOG_INF("%s\n", current_text.c_str());
-    } else {
-        print_progress_bar(step, total_steps);
-        
-        // Print newline only at the end
-        if (step == total_steps - 1) {
-            fprintf(stderr, "\n");
-        }
+        printf("%s\n", current_text.c_str());
     }
+    
+    fflush(stdout);
 
     return true;
 }
@@ -504,7 +491,8 @@ static void diffusion_generate(llama_context *          ctx,
     int64_t time_end = ggml_time_us();
     total_time += time_end - time_start;
 
-    LOG_INF("\ntotal time: %0.2fms, time per step: %0.2fms, sampling time per step: %0.2fms\n",
+    // Print final timing info
+    LOG_INF("total time: %0.2fms, time per step: %0.2fms, sampling time per step: %0.2fms\n",
             total_time / 1000.0,
             total_time / 1000.0 / params.steps,
             total_sampling_time / 1000.0 / params.steps);
