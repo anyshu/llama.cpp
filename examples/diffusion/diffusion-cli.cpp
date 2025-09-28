@@ -133,12 +133,13 @@ static bool diffusion_step_callback(int32_t             step,
     auto print_progress_bar = [](int32_t step, int32_t total_steps) {
         int progress_percent = (step * 100) / total_steps;
         int progress_bars    = (step * 50) / total_steps;
-        LOG_INF("\rdiffusion step: %d/%d [%s%s] %d%%",
+        fprintf(stderr, "\rdiffusion step: %d/%d [%s%s] %d%%",
                 step,
                 total_steps,
                 std::string(progress_bars, '=').c_str(),
                 std::string(50 - progress_bars, ' ').c_str(),
                 progress_percent);
+        fflush(stderr);  // Ensure immediate output
     };
 
     if (data->diff_params->visual_mode) {
@@ -170,6 +171,11 @@ static bool diffusion_step_callback(int32_t             step,
         LOG_INF("%s\n", current_text.c_str());
     } else {
         print_progress_bar(step, total_steps);
+        
+        // Print newline only at the end
+        if (step == total_steps - 1) {
+            fprintf(stderr, "\n");
+        }
     }
 
     return true;
