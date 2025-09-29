@@ -4,7 +4,9 @@
 #include "llama.h"
 #include "log.h"
 
+
 #include <limits.h>
+#include <iostream>
 
 #include <algorithm>
 #include <cmath>
@@ -582,43 +584,18 @@ int main(int argc, char ** argv) {
 
     const llama_vocab * vocab            = llama_model_get_vocab(model);
 
-    std::string         formatted_prompt = format_input_text(params.prompt, params.system_prompt, params.enable_chat_template, model);
-
-    std::vector<llama_token> input_tokens = common_tokenize(vocab,
-                                                            formatted_prompt,
-                                                            /*add special tokens*/ true,
-                                                            /*parse special*/ true);
-
-    int n_input = input_tokens.size();
-
-    if (n_input >= params.n_ctx) {
-        LOG_ERR("error: input too long (%d tokens), max context is %d\n", n_input, params.n_ctx);
-        llama_free(ctx);
-        llama_model_free(model);
-        return 1;
-    }
-
     llama_token mask_token_id = llama_vocab_mask(vocab);
-
     GGML_ASSERT(mask_token_id != LLAMA_TOKEN_NULL);
-
     bool visual_mode = params.diffusion.visual_mode;
-
-    int32_t                  n_generated = 0;
-    std::vector<llama_token> output_tokens(params.n_ubatch);
-
     struct diffusion_params diff_params;
-
     char shift_logits_str[8];
     if (llama_model_meta_val_str(model, "diffusion.shift_logits", shift_logits_str, sizeof(shift_logits_str)) >= 0) {
         diff_params.shift_logits = (strcmp(shift_logits_str, "true") == 0);
     } else {
         diff_params.shift_logits = true;
     }
-
     //Use either eps or block length, but not both
     GGML_ASSERT((params.diffusion.eps == 0) ^ (params.diffusion.block_length == 0));
-
     if (params.diffusion.eps) {
         diff_params.schedule = TIMESTEP_BASED;
         diff_params.eps      = params.diffusion.eps;
@@ -626,7 +603,6 @@ int main(int argc, char ** argv) {
         diff_params.schedule     = BLOCK_BASED;
         diff_params.block_length = params.diffusion.block_length;
     }
-
     diff_params.mask_token_id    = mask_token_id;
     diff_params.seed             = params.sampling.seed;
     diff_params.temperature      = params.sampling.temp;
@@ -637,51 +613,64 @@ int main(int argc, char ** argv) {
     diff_params.top_k            = params.sampling.top_k;
     diff_params.visual_mode      = params.diffusion.visual_mode;
     diff_params.add_gumbel_noise = params.diffusion.add_gumbel_noise;
-
-    diff_params.step_callback           = diffusion_step_callback;
-    callback_data cb_data               = { &diff_params, vocab, n_input };
+    diff_params.step_callback    = diffusion_step_callback;
+    // 交互模式
+    if (params.prompt.empty()) {
+        LOG_INF("进入交互模式，输入 exit 或 quit 退出。\n");
+        std::string user_prompt;
+        while (true) {
+            printf("\n请输入问题：");
+            std::getline(std::cin, user_prompt);
+            if (user_prompt.empty()) continue;
+            if (user_prompt == "exit" || user_prompt == "quit") break;
+            std::string formatted_prompt = format_input_text(user_prompt, params.system_prompt, params.enable_chat_template, model);
+            std::vector<llama_token> input_tokens = common_tokenize(vocab, formatted_prompt, true, true);
+            int n_input = input_tokens.size();
+            if (n_input >= params.n_ctx) {
+                LOG_ERR("error: input too long (%d tokens), max context is %d\n", n_input, params.n_ctx);
+                continue;
+            }
+            std::vector<llama_token> output_tokens(params.n_ubatch);
+            callback_data cb_data = { &diff_params, vocab, n_input };
+            diff_params.step_callback_user_data = &cb_data;
+            int n_generated = 0;
+            diffusion_generate(ctx, input_tokens.data(), output_tokens.data(), n_input, diff_params, n_generated);
+            output_tokens.erase(output_tokens.begin(), output_tokens.begin() + n_input);
+            std::string output_data = common_detokenize(vocab, output_tokens, false);
+            //LOG_INF("\n%s\n", output_data.c_str());
+        }
+        llama_free(ctx);
+        llama_model_free(model);
+        llama_backend_free();
+        return 0;
+    }
+    // 非交互模式，原有逻辑
+    std::string formatted_prompt = format_input_text(params.prompt, params.system_prompt, params.enable_chat_template, model);
+    std::vector<llama_token> input_tokens = common_tokenize(vocab, formatted_prompt, true, true);
+    int n_input = input_tokens.size();
+    if (n_input >= params.n_ctx) {
+        LOG_ERR("error: input too long (%d tokens), max context is %d\n", n_input, params.n_ctx);
+        llama_free(ctx);
+        llama_model_free(model);
+        return 1;
+    }
+    std::vector<llama_token> output_tokens(params.n_ubatch);
+    callback_data cb_data = { &diff_params, vocab, n_input };
     diff_params.step_callback_user_data = &cb_data;
-
-    const char * alg_names[]   = { "ORIGIN", "ENTROPY_BASED", "MARGIN_BASED", "RANDOM", "CONFIDENCE_BASED" };
-    const char * sched_names[] = { "TIMESTEP_BASED", "BLOCK_BASED" };
-    const char * alg_name =
-        (diff_params.algorithm >= 0 && diff_params.algorithm <= 4) ? alg_names[diff_params.algorithm] : "UNKNOWN";
-    const char * sched_name =
-        (diff_params.schedule >= 0 && diff_params.schedule <= 1) ? sched_names[diff_params.schedule] : "UNKNOWN";
-
-    LOG_INF("diffusion_params: - %-25s llama_token      = %d\n", "mask_token_id", mask_token_id);
-    LOG_INF("diffusion_params: - %-25s u32              = %d\n", "steps", diff_params.steps);
-    LOG_INF("diffusion_params: - %-25s u32              = %d\n", "max_length", diff_params.max_length);
-    LOG_INF("diffusion_params: - %-25s enum             = %d (%s)\n", "algorithm", diff_params.algorithm, alg_name);
-    LOG_INF("diffusion_params: - %-25s enum             = %d (%s)\n", "schedule", diff_params.schedule, sched_name);
-    LOG_INF("diffusion_params: - %-25s f32              = %.3f\n", "temperature", diff_params.temperature);
-    if (diff_params.schedule == TIMESTEP_BASED) {
-        LOG_INF("diffusion_params: - %-25s f32              = %.6f\n", "eps", diff_params.eps);
-        LOG_INF("diffusion_params: - %-25s f32              = %.3f\n", "alg_temp", diff_params.alg_temp);
-    }
-    if (diff_params.schedule == BLOCK_BASED) {
-        LOG_INF("diffusion_params: - %-25s u32              = %d\n", "block_length", diff_params.block_length);
-        LOG_INF("diffusion_params: - %-25s f32              = %.3f\n", "cfg_scale", diff_params.cfg_scale);
-    }
-
+    int n_generated = 0;
     diffusion_generate(ctx, input_tokens.data(), output_tokens.data(), n_input, diff_params, n_generated);
-
     if (n_generated > 0) {
         if (visual_mode) {
-            //clear screen and move cursor to top-left
             LOG_INF("\033[2J\033[H");
         }
-
         output_tokens.erase(output_tokens.begin(), output_tokens.begin() + n_input);
         std::string output_data = common_detokenize(vocab, output_tokens, false);
         LOG_INF("\n%s\n", output_data.c_str());
     } else {
         LOG_INF("Error: diffusion generation failed\n");
     }
-
     llama_free(ctx);
     llama_model_free(model);
     llama_backend_free();
-
     return 0;
 }
