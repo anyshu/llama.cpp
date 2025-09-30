@@ -722,6 +722,8 @@ struct callback_data {
     int32_t             n_input;
     void *              slot;           // For streaming updates (server_slot*)
     void *              ctx_server;     // For sending partial responses (server_context*)
+    std::string         last_sent_text; // Track last sent text for delta calculation
+    llama_token *       last_tokens;   // Track last tokens for partial text decoding
 };
 
 // Forward declarations for diffusion functions
@@ -1294,8 +1296,15 @@ struct server_task_result_cmpl_partial : server_task_result {
             });
         }
 
-        for (const auto & diff : oaicompat_msg_diffs) {
-            add_delta(common_chat_msg_diff_to_json_oaicompat<json>(diff));
+        // For diffusion tasks, oaicompat_msg_diffs will be empty
+        // In that case, use the content field directly
+        if (!oaicompat_msg_diffs.empty()) {
+            for (const auto & diff : oaicompat_msg_diffs) {
+                add_delta(common_chat_msg_diff_to_json_oaicompat<json>(diff));
+            }
+        } else if (!content.empty() && !is_progress) {
+            // For diffusion or other tasks without diffs, send content directly
+            add_delta({{"content", content}});
         }
 
         if (!deltas.empty()) {
@@ -2936,7 +2945,11 @@ struct server_context {
             res->content = tkn.text_to_send;
             res->tokens  = { tkn.tok };
 
-            slot.update_chat_msg(res->oaicompat_msg_diffs);
+            // For diffusion tasks, skip chat message diff computation because tokens are replaced, not appended
+            // This avoids the "Invalid diff" error when text doesn't grow monotonically
+            if (slot.task_type != SERVER_TASK_TYPE_DIFFUSION) {
+                slot.update_chat_msg(res->oaicompat_msg_diffs);
+            }
         }
 
         res->n_decoded           = slot.n_decoded;
@@ -4036,9 +4049,18 @@ struct server_context {
                         diff_params.seed = slot.params.sampling.seed;
                         diff_params.mask_token_id = llama_vocab_mask(vocab);
                         
-                        // Set up callback
+                        // Set up callback with allocated last_tokens buffer
                         const auto & prompt_text_tokens = slot.prompt_tokens.get_text_tokens();
-                        callback_data cb_data = { &diff_params, vocab, (int32_t)prompt_text_tokens.size(), &slot, this };
+                        std::vector<llama_token> last_tokens_buffer(diff_params.max_length);
+                        callback_data cb_data = { 
+                            &diff_params, 
+                            vocab, 
+                            (int32_t)prompt_text_tokens.size(), 
+                            &slot, 
+                            this, 
+                            "", 
+                            last_tokens_buffer.data() 
+                        };
                         diff_params.step_callback = diffusion_step_callback;
                         diff_params.step_callback_user_data = &cb_data;
 
@@ -4078,17 +4100,31 @@ struct server_context {
                             slot.generated_text = output_text;
                             slot.generated_tokens = filtered_tokens;
                             
-                            // For streaming mode, send the complete text as a single chunk before the final response
-                            if (slot.params.stream && !output_text.empty()) {
+                            slot.n_decoded = filtered_tokens.size();
+                            slot.has_next_token = false;
+                            slot.stop = STOP_TYPE_LIMIT;
+                            
+                            // For non-streaming mode or if no intermediate updates were sent,
+                            // send the complete text as a single chunk before the final response
+                            // In streaming mode with callbacks, the text was already sent incrementally
+                            if (slot.params.stream) {
+                                // Check if we need to send any remaining text that wasn't sent by callback
+                                if (cb_data.last_sent_text != output_text && !output_text.empty()) {
+                                    std::string remaining_text = output_text.substr(cb_data.last_sent_text.length());
+                                    if (!remaining_text.empty()) {
+                                        completion_token_output result;
+                                        result.tok = -1;
+                                        result.text_to_send = remaining_text;
+                                        result.prob = 1.0f;
+                                        send_partial_response(slot, result, false);
+                                    }
+                                }
+                            } else if (!output_text.empty()) {
+                                // Non-streaming: send complete text at once
                                 completion_token_output result;
-                                result.tok = -1; // No specific token for diffusion output
+                                result.tok = -1;
                                 result.text_to_send = output_text;
                                 result.prob = 1.0f;
-                                
-                                slot.n_decoded = filtered_tokens.size();
-                                slot.has_next_token = false;
-                                slot.stop = STOP_TYPE_LIMIT;
-                                
                                 send_partial_response(slot, result, false);
                             }
                             
@@ -4766,21 +4802,63 @@ static bool diffusion_step_callback(int32_t             step,
             (slot && slot->params.stream) ? 1 : 0,
             current_text.length());
     
-    if (slot && ctx_server && slot->params.stream) {
-        // Send progress update more frequently to show diffusion process
-        const int update_interval = std::max(1, total_steps / 50); // Send ~50 updates
-        if (step % update_interval == 0 || step == total_steps - 1) {
-            SRV_INF("Sending diffusion update: step=%d, interval=%d, first_100_chars='%.100s...'\n",
-                    step, update_interval, current_text.c_str());
-            
-            completion_token_output progress_token;
-            progress_token.tok = -1; // Special value for progress
-            progress_token.text_to_send = current_text;
-            progress_token.prob = 1.0f;
-            
-            // Use is_progress=false to send actual content instead of progress info
-            ctx_server->send_partial_response(*slot, progress_token, false);
+    if (slot && ctx_server && slot->params.stream) {        
+        // Always send on first step, last step, or at regular intervals
+        bool should_send = (step == 0) || 
+                          (step == total_steps - 1);
+        
+        // Also send if text has changed significantly (more tokens decoded)
+        if (!should_send && current_text.length() > data->last_sent_text.length() + 10) {
+            should_send = true;
         }
+
+        //for chat/completions
+        if (should_send) {
+            std::string delta_text;
+            // Track token changes for debugging
+            if (data->last_tokens && step > 0) {
+                int32_t changed_tokens = 0;
+                std::string changes_debug;
+                for (int32_t i = data->n_input; i < n_tokens && i < data->diff_params->max_length; i++) {
+                    if (data->last_tokens[i] != tokens[i]) {
+                        changed_tokens++;
+                        if (changes_debug.length() < 200) { // Limit debug output
+                            char old_piece[64], new_piece[64];
+                            int old_n_chars = llama_token_to_piece(data->vocab, data->last_tokens[i], old_piece, sizeof(old_piece), 0, false);
+                            int new_n_chars = llama_token_to_piece(data->vocab, tokens[i], new_piece, sizeof(new_piece), 0, false);
+                            old_piece[old_n_chars] = '\0';
+                            new_piece[new_n_chars] = '\0';
+                            changes_debug += string_format("[%d: '%s'->'%s'] ", i - data->n_input, old_piece, new_piece);
+                        }
+                    }
+                }
+                if (changed_tokens > 0) {
+                    delta_text = string_format("Token changes at step %d: %d tokens changed - %s\n",
+                            step, changed_tokens, changes_debug.c_str());
+                    SRV_INF("%s", delta_text.c_str());
+                }
+            }
+            
+            if (!delta_text.empty()) {
+                SRV_INF("Sending diffusion delta: step=%d/%d, delta_len=%zu, delta=%s\n",
+                        step, total_steps, delta_text.length(), delta_text.c_str());
+                
+                completion_token_output progress_token;
+                progress_token.tok = -1; // Special value for progress
+                progress_token.text_to_send = delta_text;
+                progress_token.prob = 1.0f;
+                
+                // Use is_progress=false to send actual content instead of progress info
+                ctx_server->send_partial_response(*slot, progress_token, false);
+                
+                // Update last sent text
+                data->last_sent_text = current_text;
+            }
+        }
+    }
+    // Save current tokens for next comparison
+    if (data->last_tokens) {
+        std::memcpy(data->last_tokens, tokens, n_tokens * sizeof(llama_token));
     }
 
     return true;
@@ -5571,8 +5649,17 @@ int main(int argc, char ** argv) {
             ctx_server.oai_parser_opt,
             files);
 
+        // Check if this is a diffusion request by looking for diffusion-specific parameters
+        bool is_diffusion = data.contains("diffusion_steps") || 
+                           data.contains("diffusion_algorithm") || 
+                           data.contains("cfg_scale") ||
+                           data.contains("visual_mode") ||
+                           data.contains("max_length");
+        
+        server_task_type task_type = is_diffusion ? SERVER_TASK_TYPE_DIFFUSION : SERVER_TASK_TYPE_COMPLETION;
+
         handle_completions_impl(
-            SERVER_TASK_TYPE_COMPLETION,
+            task_type,
             data,
             files,
             req.is_connection_closed,
