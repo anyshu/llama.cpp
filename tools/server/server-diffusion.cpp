@@ -11,53 +11,14 @@
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
-// diffusion support - based on examples/diffusion/diffusion-cli.cpp
-enum diffusion_algorithm { 
-    ORIGIN = 0, 
-    ENTROPY_BASED = 1, 
-    MARGIN_BASED = 2, 
-    RANDOM = 3, 
-    CONFIDENCE_BASED = 4 
-};
-
-typedef bool (*diffusion_step_callback_t)(int32_t step,
-                                          int32_t total_steps,
-                                          const llama_token * tokens,
-                                          int32_t n_tokens,
-                                          void * user_data);
-
-struct diffusion_params {
-    int32_t steps = 128;
-    float temperature = 0.0f;
-    llama_token mask_token_id = LLAMA_TOKEN_NULL;
-    diffusion_step_callback_t step_callback = nullptr;
-    void * step_callback_user_data = nullptr;
-    int32_t seed = 0;
-    bool visual_mode = false;
-    bool shift_logits = false;
-    
-    float top_p = 0.0f;
-    int32_t top_k = 0;
-    
-    diffusion_algorithm algorithm = CONFIDENCE_BASED;
-    
-    float cfg_scale = 0.0f;
-    float eps = 0.0f;
-    float alg_temp = 0.0f;
-    bool add_gumbel_noise = false;
-    
-    int32_t max_length = 512;
-};
-
-// 声明扩散生成函数
-static int diffusion_generate(
-    llama_context* ctx,
-    const llama_token* prompt_tokens,
-    llama_token* output_tokens,
-    int32_t n_prompt,
-    const diffusion_params& params,
-    int32_t& n_generated
-);
+#include <limits.h>
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <random>
+#include <string>
+#include <vector>
 
 // mime type for sending response
 #define MIMETYPE_JSON "application/json; charset=utf-8"
@@ -83,15 +44,19 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+enum diffusion_algorithm { ORIGIN = 0, ENTROPY_BASED = 1, MARGIN_BASED = 2, RANDOM = 3, CONFIDENCE_BASED = 4 };
 
-class ModelTypeDetector {
-    public:
-        enum ModelType { STANDARD, DIFFUSION };
-
-        static ModelType detect(const llama_model* model) {
-            return llama_model_is_diffusion(model) ? DIFFUSION : STANDARD;
-        }
+// Unified transfer scheduling methods
+enum transfer_schedule {
+    TIMESTEP_BASED = 0,  // Dream-style: (1.0 - s/t) * remaining
+    BLOCK_BASED    = 1,  // LLaDA-style: process in blocks with get_num_transfer_tokens
 };
+
+typedef bool (*diffusion_step_callback_t)(int32_t             step,
+                                          int32_t             total_steps,
+                                          const llama_token * tokens,
+                                          int32_t             n_tokens,
+                                          void *              user_data);
 
 enum stop_type {
     STOP_TYPE_NONE,
@@ -116,6 +81,7 @@ enum server_state {
 
 enum server_task_type {
     SERVER_TASK_TYPE_COMPLETION,
+    SERVER_TASK_TYPE_DIFFUSION,
     SERVER_TASK_TYPE_EMBEDDING,
     SERVER_TASK_TYPE_RERANK,
     SERVER_TASK_TYPE_INFILL,
@@ -160,6 +126,7 @@ static bool server_task_type_need_embd(server_task_type task_type) {
 static bool server_task_type_need_logits(server_task_type task_type) {
     switch (task_type) {
         case SERVER_TASK_TYPE_COMPLETION:
+        case SERVER_TASK_TYPE_DIFFUSION:
         case SERVER_TASK_TYPE_INFILL:
             return true;
         default:
@@ -201,6 +168,19 @@ struct slot_params {
 
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
+
+    // Diffusion parameters
+    int32_t             diffusion_steps      = 128;
+    diffusion_algorithm diffusion_algo       = CONFIDENCE_BASED;
+    transfer_schedule   diffusion_schedule   = TIMESTEP_BASED;
+    float               diffusion_eps        = 0.001f;
+    int32_t             diffusion_block_len  = 0;
+    float               diffusion_cfg_scale  = 1.0f;
+    float               diffusion_alg_temp   = 0.0f;
+    bool                diffusion_visual     = false;
+    bool                diffusion_shift_logits = true;
+    bool                diffusion_add_gumbel_noise = false;
+    int32_t             diffusion_max_length = 128;
 
     json to_json(bool only_metrics = false) const {
         std::vector<std::string> samplers;
@@ -315,6 +295,17 @@ struct slot_params {
             {"timings_per_token",         timings_per_token},
             {"post_sampling_probs",       post_sampling_probs},
             {"lora",                      lora},
+            {"diffusion_steps",           diffusion_steps},
+            {"diffusion_algorithm",       diffusion_algo},
+            {"diffusion_schedule",        diffusion_schedule},
+            {"diffusion_eps",             diffusion_eps},
+            {"diffusion_block_len",       diffusion_block_len},
+            {"diffusion_cfg_scale",       diffusion_cfg_scale},
+            {"diffusion_alg_temp",        diffusion_alg_temp},
+            {"diffusion_visual",          diffusion_visual},
+            {"diffusion_shift_logits",    diffusion_shift_logits},
+            {"diffusion_add_gumbel_noise", diffusion_add_gumbel_noise},
+            {"diffusion_max_length",      diffusion_max_length},
         };
     }
 };
@@ -346,10 +337,6 @@ struct server_task {
 
     // used by SERVER_TASK_TYPE_SET_LORA
     std::vector<common_adapter_lora_info> set_lora;
-
-    // 扩散模型相关字段
-    bool is_diffusion_task = false;
-    diffusion_params diff_params;
 
     server_task(server_task_type type) : type(type) {}
 
@@ -658,6 +645,36 @@ struct server_task {
             }
         }
 
+        // Diffusion parameters
+        params.diffusion_steps = json_value(data, "diffusion_steps", params.diffusion_steps);
+        
+        // Parse diffusion algorithm from string or int
+        const auto diffusion_alg = data.find("diffusion_algorithm");
+        if (diffusion_alg != data.end()) {
+            if (diffusion_alg->is_string()) {
+                std::string alg_str = diffusion_alg->get<std::string>();
+                if (alg_str == "origin") params.diffusion_algo = ORIGIN;
+                else if (alg_str == "entropy") params.diffusion_algo = ENTROPY_BASED;
+                else if (alg_str == "margin") params.diffusion_algo = MARGIN_BASED;
+                else if (alg_str == "random") params.diffusion_algo = RANDOM;
+                else if (alg_str == "confidence") params.diffusion_algo = CONFIDENCE_BASED;
+            } else if (diffusion_alg->is_number_integer()) {
+                int alg_int = diffusion_alg->get<int>();
+                if (alg_int >= 0 && alg_int <= 4) {
+                    params.diffusion_algo = static_cast<diffusion_algorithm>(alg_int);
+                }
+            }
+        }
+        
+        params.diffusion_eps = json_value(data, "diffusion_eps", params.diffusion_eps);
+        params.diffusion_block_len = json_value(data, "diffusion_block_length", params.diffusion_block_len);
+        params.diffusion_cfg_scale = json_value(data, "cfg_scale", params.diffusion_cfg_scale);
+        params.diffusion_alg_temp = json_value(data, "diffusion_temperature", params.diffusion_alg_temp);
+        params.diffusion_visual = json_value(data, "visual_mode", params.diffusion_visual);
+        params.diffusion_shift_logits = json_value(data, "shift_logits", params.diffusion_shift_logits);
+        params.diffusion_add_gumbel_noise = json_value(data, "add_gumbel_noise", params.diffusion_add_gumbel_noise);
+        params.diffusion_max_length = json_value(data, "max_length", params.diffusion_max_length);
+
         std::string model_name = params_base.model_alias.empty() ? DEFAULT_OAICOMPAT_MODEL : params_base.model_alias;
         params.oaicompat_model = json_value(data, "model", model_name);
 
@@ -673,6 +690,66 @@ struct server_task {
         return ids;
     }
 };
+
+struct diffusion_params {
+    int32_t                   steps                   = 0;
+    float                     temperature             = 0;
+    llama_token               mask_token_id           = LLAMA_TOKEN_NULL;
+    diffusion_step_callback_t step_callback           = nullptr;
+    void *                    step_callback_user_data = nullptr;
+    int32_t                   seed                    = 0;
+    bool                      visual_mode             = false;
+    bool                      shift_logits            = true;  // Shift logits by -1 after decode
+
+    float   top_p = 0.;
+    int32_t top_k = 0.;
+
+    diffusion_algorithm algorithm = CONFIDENCE_BASED;
+    transfer_schedule   schedule  = TIMESTEP_BASED;
+
+    float   cfg_scale        = 0.;     // Config scale for classifier-free guidance
+    float   eps              = 0.;     // Timestep scheduling
+    int32_t block_length     = 0;      // Block size (for block scheduling)
+    float   alg_temp         = 0;      // algorithm temperature (0.0 = deterministic)
+    bool    add_gumbel_noise = false;  // Add gumbel noise to the logits if temp > 0.0
+
+    int32_t max_length = 0;            // Maximum sequence length
+};
+
+struct callback_data {
+    diffusion_params *  diff_params;
+    const llama_vocab * vocab;
+    int32_t             n_input;
+};
+
+// Forward declarations for diffusion functions
+static float calculate_confidence(const llama_token_data_array & cur_p,
+                                  diffusion_algorithm            algorithm,
+                                  std::mt19937 &                 rng);
+
+static int32_t calculate_transfer_count(int32_t                      step,
+                                        int32_t                      total_steps,
+                                        int32_t                      remaining_masked,
+                                        transfer_schedule            schedule,
+                                        float                        eps,
+                                        const std::vector<int32_t> & num_transfer_tokens = {});
+
+static bool diffusion_step_callback(int32_t             step,
+                                    int32_t             total_steps,
+                                    const llama_token * tokens,
+                                    int32_t             n_tokens,
+                                    void *              user_data);
+
+static void add_gumbel_noise(float * logits, int32_t n_vocab, float temperature, std::mt19937 & rng);
+
+static std::vector<int32_t> get_num_transfer_tokens(int32_t mask_count, int32_t steps);
+
+static void diffusion_generate(llama_context *          ctx,
+                               const llama_token *      input_tokens,
+                               llama_token *            output_tokens,
+                               int32_t                  n_input,
+                               const diffusion_params & params,
+                               int32_t &                n_generated);
 
 struct result_timings {
     int32_t cache_n = -1;
@@ -1100,9 +1177,6 @@ struct server_task_result_cmpl_partial : server_task_result {
     std::string     oaicompat_model;
     std::string     oaicompat_cmpl_id;
     std::vector<common_chat_msg_diff> oaicompat_msg_diffs;
-    
-    // Diffusion model fields
-    json diffusion_progress;
 
     virtual int get_index() override {
         return index;
@@ -1146,9 +1220,6 @@ struct server_task_result_cmpl_partial : server_task_result {
         if (!prob_output.probs.empty()) {
             res["completion_probabilities"] = completion_token_output::probs_vector_to_json({prob_output}, post_sampling_probs);
         }
-        if (!diffusion_progress.is_null()) {
-            res["diffusion_progress"] = diffusion_progress;
-        }
         return res;
     }
 
@@ -1185,9 +1256,6 @@ struct server_task_result_cmpl_partial : server_task_result {
         }
         if (is_progress) {
             res.push_back({"prompt_progress", progress.to_json()});
-        }
-        if (!diffusion_progress.is_null()) {
-            res["choices"][0]["diffusion_progress"] = diffusion_progress;
         }
 
         return res;
@@ -1242,9 +1310,6 @@ struct server_task_result_cmpl_partial : server_task_result {
             }
             if (is_progress) {
                 last_json.push_back({"prompt_progress", progress.to_json()});
-            }
-            if (!diffusion_progress.is_null()) {
-                last_json.at("choices").at(0)["diffusion_progress"] = diffusion_progress;
             }
         }
 
@@ -1568,14 +1633,9 @@ struct server_slot {
     int32_t n_draft_total = 0;      // Total draft tokens generated
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
 
-    // 模型类型标记
-    ModelTypeDetector::ModelType model_type = ModelTypeDetector::STANDARD;
-
-    // 扩散专用状态
-    diffusion_params diff_params;
-    std::vector<llama_token> diffusion_tokens;
-    int32_t diffusion_step = 0;
-    int32_t total_diffusion_steps = 0;
+    // Diffusion-specific fields
+    bool is_diffusion_task = false;
+    std::vector<llama_token> diffusion_output_tokens;
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -1604,13 +1664,12 @@ struct server_slot {
         n_draft_total = 0;
         n_draft_accepted = 0;
 
+        // clear diffusion fields
+        is_diffusion_task = false;
+        diffusion_output_tokens.clear();
+
         // clear alora start
         alora_invocation_start = -1;
-
-        // clear diffusion stats
-        diffusion_step = 0;
-        total_diffusion_steps = 0;
-        diffusion_tokens.clear();
     }
 
     bool need_embd() const {
@@ -1655,12 +1714,6 @@ struct server_slot {
 
     bool can_speculate() const {
         return ctx_dft && params.speculative.n_max > 0 && params.cache_prompt;
-    }
-
-    // 生成方法选择
-    bool is_diffusion_generation() const {
-        return model_type == ModelTypeDetector::DIFFUSION &&
-               task_type == SERVER_TASK_TYPE_COMPLETION;
     }
 
     void add_token(const completion_token_output & token) {
@@ -1814,8 +1867,6 @@ struct server_slot {
             },
         };
     }
-
-    // 模型类型定义已在上面，这里移除重复定义
 };
 
 struct server_metrics {
@@ -2176,60 +2227,6 @@ struct server_response {
     }
 };
 
-// 扩散参数解析函数
-static void parse_diffusion_params(const json& data, diffusion_params& diff_params) {
-    // 扩散步数
-    if (data.contains("diffusion_steps")) {
-        diff_params.steps = data.at("diffusion_steps").get<int32_t>();
-        if (diff_params.steps < 1 || diff_params.steps > 1000) {
-            throw std::invalid_argument("diffusion_steps must be between 1-1000");
-        }
-    }
-
-    // 扩散算法
-    if (data.contains("diffusion_algorithm")) {
-        std::string alg = data.at("diffusion_algorithm").get<std::string>();
-        if (alg == "confidence") diff_params.algorithm = CONFIDENCE_BASED;
-        else if (alg == "entropy") diff_params.algorithm = ENTROPY_BASED;
-        else if (alg == "margin") diff_params.algorithm = MARGIN_BASED;
-        else if (alg == "random") diff_params.algorithm = RANDOM;
-        else if (alg == "origin") diff_params.algorithm = ORIGIN;
-        else throw std::invalid_argument("Invalid diffusion_algorithm");
-    }
-
-    // CFG 比例
-    if (data.contains("cfg_scale")) {
-        diff_params.cfg_scale = data.at("cfg_scale").get<float>();
-        if (diff_params.cfg_scale < 0.0f || diff_params.cfg_scale > 20.0f) {
-            throw std::invalid_argument("cfg_scale must be between 0.0-20.0");
-        }
-    }
-
-    // 最大长度
-    if (data.contains("max_length")) {
-        diff_params.max_length = data.at("max_length").get<int32_t>();
-        if (diff_params.max_length < 1 || diff_params.max_length > 32768) {
-            throw std::invalid_argument("max_length must be between 1-32768");
-        }
-    }
-
-    // 扩散采样温度
-    if (data.contains("diffusion_temperature")) {
-        diff_params.temperature = data.at("diffusion_temperature").get<float>();
-        if (diff_params.temperature < 0.0f || diff_params.temperature > 2.0f) {
-            throw std::invalid_argument("diffusion_temperature must be between 0.0-2.0");
-        }
-    }
-
-    // 可视化模式
-    if (data.contains("visual_mode")) {
-        diff_params.visual_mode = data.at("visual_mode").get<bool>();
-    }
-
-    // 注意：shift_logits 参数在当前实现中暂不支持，因为它需要模型层面的支持
-    // 可以在未来的版本中添加
-}
-
 struct server_context {
     common_params params_base;
 
@@ -2271,22 +2268,6 @@ struct server_context {
 
     common_chat_templates_ptr chat_templates;
     oaicompat_parser_options  oai_parser_opt;
-
-    // 模型类型
-    ModelTypeDetector::ModelType model_type;
-    
-    // 默认扩散参数
-    diffusion_params default_diffusion_params;
-
-    server_context() {
-        // 模型类型将在 load_model() 中检测
-        model_type = ModelTypeDetector::ModelType::STANDARD;
-
-        // 为扩散模型初始化特殊参数
-        if (model_type == ModelTypeDetector::ModelType::DIFFUSION) {
-            init_diffusion_params();
-        }
-    }
 
     ~server_context() {
         mtmd_free(mctx);
@@ -2420,17 +2401,11 @@ struct server_context {
             }
         }
 
-        // 检测模型类型（模型加载完成后）
-        model_type = llama_model_is_diffusion(model) ?
-                    ModelTypeDetector::ModelType::DIFFUSION : ModelTypeDetector::ModelType::STANDARD;
-
-        LOG_INF("Model type detected: %s\n",
-                model_type == ModelTypeDetector::ModelType::DIFFUSION ? "Diffusion" : "Standard");
-
-        // 初始化扩散参数
-        if (model_type == ModelTypeDetector::ModelType::DIFFUSION) {
-            init_diffusion_params();
-        }
+        // Check if this is a diffusion model when needed
+        // Note: We'll accept both diffusion and non-diffusion models,
+        // since the route handler will determine the appropriate processing
+        SRV_INF("Model loaded successfully, diffusion support: %s\n", 
+                llama_model_is_diffusion(model) ? "yes" : "no");
 
         return true;
     }
@@ -2473,9 +2448,6 @@ struct server_context {
 
             slot.params.sampling = params_base.sampling;
             slot.params.n_keep = params_base.n_keep;
-
-            // 设置slot的模型类型
-            slot.model_type = model_type;
 
             slot.callback_on_release = [this](int) {
                 queue_tasks.pop_deferred_task();
@@ -2595,41 +2567,6 @@ struct server_context {
         slot.task_type     = task.type;
         slot.params        = std::move(task.params);
         slot.prompt_tokens = std::move(task.prompt_tokens);
-        
-        // 设置模型类型
-        slot.model_type = model_type;
-        
-        // 如果是扩散模型任务，设置扩散参数
-        if (slot.is_diffusion_generation()) {
-            // 首先使用默认参数
-            slot.diff_params = default_diffusion_params;
-            
-            // 如果任务标记为扩散任务且包含自定义参数，使用它们覆盖默认值
-            if (task.is_diffusion_task) {
-                // 合并任务特定的扩散参数
-                if (task.diff_params.steps > 0) {
-                    slot.diff_params.steps = task.diff_params.steps;
-                }
-                if (task.diff_params.algorithm >= 0) {
-                    slot.diff_params.algorithm = task.diff_params.algorithm;
-                }
-                if (task.diff_params.temperature >= 0.0f) {
-                    slot.diff_params.temperature = task.diff_params.temperature;
-                }
-                if (task.diff_params.cfg_scale > 0.0f) {
-                    slot.diff_params.cfg_scale = task.diff_params.cfg_scale;
-                }
-                if (task.diff_params.max_length > 0) {
-                    slot.diff_params.max_length = task.diff_params.max_length;
-                }
-                slot.diff_params.visual_mode = task.diff_params.visual_mode;
-            }
-            
-            slot.total_diffusion_steps = slot.diff_params.steps;
-            
-            SLT_INF(slot, "Diffusion task configured with %d steps, algorithm %d, temperature %.2f\n", 
-                   slot.diff_params.steps, slot.diff_params.algorithm, slot.diff_params.temperature);
-        }
 
         if (!are_lora_equal(slot.params.lora, slot.lora)) {
             // if lora has changed, check to see if the cache should be cleared
@@ -2720,6 +2657,13 @@ struct server_context {
             llama_batch_free(slot.batch_spec);
 
             slot.batch_spec = llama_batch_init(slot.params.speculative.n_max + 1, 0, 1);
+        }
+
+        // Handle diffusion-specific initialization
+        if (slot.task_type == SERVER_TASK_TYPE_DIFFUSION) {
+            slot.is_diffusion_task = true;
+            // Prepare diffusion output tokens buffer
+            slot.diffusion_output_tokens.resize(slot.params.diffusion_max_length);
         }
 
         slot.state = SLOT_STATE_STARTED;
@@ -3246,6 +3190,7 @@ struct server_context {
     void process_single_task(server_task && task) {
         switch (task.type) {
             case SERVER_TASK_TYPE_COMPLETION:
+            case SERVER_TASK_TYPE_DIFFUSION:
             case SERVER_TASK_TYPE_INFILL:
             case SERVER_TASK_TYPE_EMBEDDING:
             case SERVER_TASK_TYPE_RERANK:
@@ -3484,7 +3429,7 @@ struct server_context {
         }
 
         {
-            SRV_INF("%s", "posting NEXT_RESPONSE\n");
+            SRV_DBG("%s", "posting NEXT_RESPONSE\n");
 
             server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
             task.id = queue_tasks.get_new_id();
@@ -3553,11 +3498,6 @@ struct server_context {
                 continue;
             }
 
-            if (slot.is_diffusion_generation()) {
-                SRV_INF("Processing diffusion slot 00x %d\n", slot.id);
-                process_diffusion_slot(slot);
-            }
-
             // check if we can batch this slot with the previous one
             if (!slot_batched) {
                 slot_batched = &slot;
@@ -3585,11 +3525,6 @@ struct server_context {
         size_t alora_disabled_id = 0;
         if (params_base.cont_batching || batch.n_tokens == 0) {
             for (auto & slot : slots) {
-                if (slot.is_diffusion_generation()) {
-                    SRV_INF("Processing diffusion slot 00w %d\n", slot.id);
-                    process_diffusion_slot(slot);
-                }
-
                 // check if we can batch this slot with the previous one
                 if (slot.is_processing()) {
                     if (!slot_batched) {
@@ -3638,7 +3573,8 @@ struct server_context {
                         }
 
                         // TODO: support memory-less logits computation
-                        if (slot.need_logits() && !llama_get_memory(ctx)) {
+                        // Allow diffusion tasks to proceed as they handle logits differently
+                        if (slot.need_logits() && !llama_get_memory(ctx) && slot.task_type != SERVER_TASK_TYPE_DIFFUSION) {
                             slot.release();
                             send_error(slot, "the current context does not logits computation. skipping", ERROR_TYPE_SERVER);
                             continue;
@@ -4050,11 +3986,6 @@ struct server_context {
             n_batch = llama_n_batch(ctx);
 
             for (auto & slot : slots) {
-                if (slot.is_diffusion_generation()) {
-                    SRV_INF("Processing diffusion slot 00p%d\n", slot.id);
-                    process_diffusion_slot(slot);
-                }
-
                 // optionally send prompt processing progress
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
                     if (slot.params.stream && slot.params.return_progress) {
@@ -4077,6 +4008,78 @@ struct server_context {
 
                     if (slot.task_type == SERVER_TASK_TYPE_RERANK) {
                         send_rerank(slot, batch_view);
+                        slot.release();
+                        slot.i_batch = -1;
+                        continue; // continue loop of slots
+                    }
+
+                    if (slot.task_type == SERVER_TASK_TYPE_DIFFUSION) {
+                        // Execute diffusion generation
+                        diffusion_params diff_params;
+                        diff_params.steps = slot.params.diffusion_steps;
+                        diff_params.algorithm = slot.params.diffusion_algo;
+                        diff_params.schedule = slot.params.diffusion_eps > 0 ? TIMESTEP_BASED : BLOCK_BASED;
+                        diff_params.eps = slot.params.diffusion_eps;
+                        diff_params.block_length = slot.params.diffusion_block_len;
+                        diff_params.cfg_scale = slot.params.diffusion_cfg_scale;
+                        diff_params.alg_temp = slot.params.diffusion_alg_temp;
+                        diff_params.visual_mode = slot.params.diffusion_visual;
+                        diff_params.shift_logits = slot.params.diffusion_shift_logits;
+                        diff_params.add_gumbel_noise = slot.params.diffusion_add_gumbel_noise;
+                        diff_params.max_length = slot.params.diffusion_max_length;
+                        diff_params.temperature = slot.params.sampling.temp;
+                        diff_params.top_p = slot.params.sampling.top_p;
+                        diff_params.top_k = slot.params.sampling.top_k;
+                        diff_params.seed = slot.params.sampling.seed;
+                        diff_params.mask_token_id = llama_vocab_mask(vocab);
+                        
+                        // Set up callback
+                        const auto & prompt_text_tokens = slot.prompt_tokens.get_text_tokens();
+                        callback_data cb_data = { &diff_params, vocab, (int32_t)prompt_text_tokens.size() };
+                        diff_params.step_callback = diffusion_step_callback;
+                        diff_params.step_callback_user_data = &cb_data;
+
+                        int32_t n_generated = 0;
+                        diffusion_generate(
+                            ctx,
+                            prompt_text_tokens.data(),
+                            slot.diffusion_output_tokens.data(),
+                            prompt_text_tokens.size(),
+                            diff_params,
+                            n_generated
+                        );
+
+                        if (n_generated > 0) {
+                            // Extract only the generated tokens (excluding input prompt)
+                            // CLI logic: output_tokens.erase(output_tokens.begin(), output_tokens.begin() + n_input);
+                            std::vector<llama_token> generated_tokens(
+                                slot.diffusion_output_tokens.begin() + prompt_text_tokens.size(),
+                                slot.diffusion_output_tokens.begin() + diff_params.max_length
+                            );
+                            
+                            // Filter out mask tokens
+                            std::vector<llama_token> filtered_tokens;
+                            llama_token mask_token_id = llama_vocab_mask(vocab);
+                            for (llama_token token : generated_tokens) {
+                                if (token != mask_token_id) {
+                                    filtered_tokens.push_back(token);
+                                }
+                            }
+                            
+                            std::string output_text = common_detokenize(vocab, filtered_tokens, false);
+                            
+                            SRV_INF("Diffusion generation completed: n_generated=%d, generated_size=%zu, filtered_size=%zu, output_text_length=%zu\n", 
+                                    n_generated, generated_tokens.size(), filtered_tokens.size(), output_text.size());
+                            SRV_INF("Generated text preview (first 500 chars): %.500s\n", output_text.c_str());
+                            
+                            slot.generated_text = output_text;
+                            slot.generated_tokens = filtered_tokens;
+                            
+                            send_final_response(slot);
+                        } else {
+                            send_error(slot, "Diffusion generation failed");
+                        }
+                        
                         slot.release();
                         slot.i_batch = -1;
                         continue; // continue loop of slots
@@ -4165,11 +4168,8 @@ struct server_context {
                 if (!slot.is_processing() || !slot.can_speculate()) {
                     continue;
                 }
-                if (slot.is_diffusion_generation()) {
-                    SRV_INF("Processing diffusion slot 00h%d\n", slot.id);
-                    process_diffusion_slot(slot);
-                }
-                if (slot.state != SLOT_STATE_GENERATING) {  
+
+                if (slot.state != SLOT_STATE_GENERATING) {
                     continue;
                 }
 
@@ -4266,18 +4266,6 @@ struct server_context {
             }
         }
 
-        // // 处理扩散模型的slot（标准模型已在上面的循环中处理）
-        // for (auto & slot : slots) {
-        //     if (!slot.is_processing()) continue;
-
-        //     if (slot.is_diffusion_generation()) {
-        //         SRV_DBG("Processing diffusion slot %d\n", slot.id);
-        //         process_diffusion_slot(slot);
-        //     } else {
-        //         SRV_DBG("Slot %d is not diffusion generation (model_type = %d)\n", slot.id, (int)slot.model_type);
-        //     }
-        // }
-
         SRV_DBG("%s", "run slots completed\n");
     }
 
@@ -4290,200 +4278,6 @@ struct server_context {
             {"n_params",    llama_model_n_params   (model)},
             {"size",        llama_model_size       (model)},
         };
-    }
-
-    void init_diffusion_params() {
-        // 从模型配置中获取 mask_token_id
-        if (model && vocab) {
-            llama_token mask_token = llama_vocab_mask(vocab);
-            if (mask_token != LLAMA_TOKEN_NULL) {
-                default_diffusion_params.mask_token_id = mask_token;
-                SRV_DBG("Found mask token: %d\n", mask_token);
-            } else {
-                SRV_WRN("No mask token found in model, using default: %d", 151666);
-                default_diffusion_params.mask_token_id = 151666; // Dream-Coder 默认值
-            }
-        }
-        default_diffusion_params.steps = 128;
-        default_diffusion_params.algorithm = CONFIDENCE_BASED;
-        default_diffusion_params.temperature = 0.0f; // 与diffusion-cli.cpp保持一致
-        default_diffusion_params.seed = 42;
-        default_diffusion_params.max_length = 512;
-    }
-
-    void process_diffusion_slot(server_slot& slot) {
-        SLT_INF(slot, "In Processing diffusion slot, state = %d\n", slot.state);
-        
-        if (slot.state == SLOT_STATE_STARTED || slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_GENERATING) {
-            SLT_INF(slot, "process_diffusion_slot Starting diffusion generation with %d steps\n", slot.diff_params.steps);
-            
-            // 确保 generated_tokens 有足够空间
-            slot.generated_tokens.resize(slot.diff_params.max_length);
-            
-            // 使用 diffusion_generate 函数
-            int32_t n_generated = 0;
-
-            // 设置回调参数 - 使用简单的回调处理
-            slot.diff_params.step_callback = nullptr; // 暂时不使用回调
-            slot.diff_params.step_callback_user_data = &slot;
-
-            // 获取输入tokens
-            const auto& input_tokens = slot.prompt_tokens.get_text_tokens();
-            
-            // 确保输出缓冲区足够大
-            slot.generated_tokens.resize(slot.diff_params.max_length);
-            
-            // 调用扩散生成
-            int result = diffusion_generate(
-                slot.ctx,
-                input_tokens.data(),
-                slot.generated_tokens.data(),
-                input_tokens.size(),
-                slot.diff_params,
-                n_generated
-            );
-            
-            if (result != 0) {
-                SRV_ERR("Diffusion generation failed with error %d\n", result);
-                slot.state = SLOT_STATE_IDLE;
-                return;
-            }
-
-            // 处理生成结果
-            if (n_generated > 0) {
-                // 调整生成的tokens大小
-                slot.generated_tokens.resize(n_generated);
-                slot.n_decoded = n_generated;
-                // Set timing to avoid division by zero in get_timings
-                if (slot.t_start_process_prompt == 0) {
-                    slot.t_start_process_prompt = ggml_time_us();
-                }
-                const int64_t t_current = ggml_time_us();
-                slot.t_prompt_processing = (t_current - slot.t_start_process_prompt) / 1e3;
-                slot.t_start_generation = t_current;
-                
-                // 构建生成的文本
-                for (int32_t i = 0; i < n_generated; i++) {
-                    std::string token_str = common_token_to_piece(ctx, slot.generated_tokens[i], false);
-                    slot.generated_text += token_str;
-                }
-                
-                slot.state = SLOT_STATE_DONE_PROMPT;
-
-                // 发送完成响应
-                send_final_response(slot);
-                slot.release();
-                metrics.on_prediction(slot);
-            } else {
-                // 生成失败，发送错误响应
-                send_error(slot, "Diffusion generation failed", ERROR_TYPE_SERVER);
-                slot.release();
-            }
-        }
-    }
-
-
-
-    void send_visual_response(server_slot& slot, int32_t step, int32_t total_steps, const llama_token* tokens, int32_t n_tokens) {
-        const llama_vocab* vocab = llama_model_get_vocab(model);
-        const llama_token mask_token = llama_vocab_mask(vocab);
-
-        // 构建当前状态文本（包含[MASK]标记）
-        std::string current_text = "";
-        int32_t mask_count = 0;
-
-        for (int32_t i = slot.n_prompt_tokens; i < n_tokens; i++) {
-            if (tokens[i] != mask_token) {
-                // 已生成的token
-                std::string token_str = common_token_to_piece(ctx, tokens[i]);
-                current_text += token_str;
-            } else {
-                // 还未生成的mask token
-                current_text += "[MASK]";
-                mask_count++;
-            }
-        }
-
-        // 构造简化的可视化响应
-        json visual_response = {
-            {"id", slot.id},
-            {"object", "text_completion.chunk"},
-            {"model", slot.params.oaicompat_model},
-            {"choices", json::array({
-                {
-                    {"index", 0},
-                    {"text", current_text},
-                    {"finish_reason", nullptr},
-                    {"diffusion_progress", {
-                        {"step", step},
-                        {"total_steps", total_steps},
-                        {"mask_count", mask_count}
-                    }}
-                }
-            })}
-        };
-
-        // 发送可视化数据 - 通过队列系统
-        auto res = std::make_unique<server_task_result_cmpl_partial>();
-        res->id = slot.id_task;
-        res->index = slot.index;
-        res->content = current_text;
-        res->n_decoded = slot.n_decoded;
-        res->n_prompt_tokens = slot.n_prompt_tokens;
-        res->verbose = slot.params.verbose;
-        res->oaicompat = slot.params.oaicompat;
-        res->oaicompat_model = slot.params.oaicompat_model;
-        res->oaicompat_cmpl_id = slot.params.oaicompat_cmpl_id;
-        
-        // 添加扩散进度信息作为自定义字段
-        res->diffusion_progress = json{
-            {"step", step},
-            {"total_steps", total_steps},
-            {"mask_count", mask_count}
-        };
-        
-        queue_results.send(std::move(res));
-    }
-
-    void send_progress_response(server_slot& slot, int32_t step, int32_t total_steps) {
-        json progress_response = {
-            {"id", slot.id},
-            {"object", "text_completion.chunk"},
-            {"model", slot.params.oaicompat_model},
-            {"choices", json::array({
-                {
-                    {"index", 0},
-                    {"text", ""}, // 扩散过程中不返回部分文本
-                    {"finish_reason", nullptr},
-                    {"diffusion_progress", {
-                        {"step", step},
-                        {"total_steps", total_steps},
-                        {"progress", float(step) / total_steps}
-                    }}
-                }
-            })}
-        };
-
-        // 发送进度数据 - 通过队列系统
-        auto res = std::make_unique<server_task_result_cmpl_partial>();
-        res->id = slot.id_task;
-        res->index = slot.index;
-        res->content = ""; // 扩散过程中不返回部分文本
-        res->n_decoded = slot.n_decoded;
-        res->n_prompt_tokens = slot.n_prompt_tokens;
-        res->verbose = slot.params.verbose;
-        res->oaicompat = slot.params.oaicompat;
-        res->oaicompat_model = slot.params.oaicompat_model;
-        res->oaicompat_cmpl_id = slot.params.oaicompat_cmpl_id;
-        
-        // 添加扩散进度信息
-        res->diffusion_progress = json{
-            {"step", step},
-            {"total_steps", total_steps},
-            {"progress", float(step) / total_steps}
-        };
-        
-        queue_results.send(std::move(res));
     }
 };
 
@@ -4515,72 +4309,33 @@ inline void signal_handler(int signal) {
     shutdown_handler(signal);
 }
 
-// Helper functions for diffusion
-static float calculate_confidence(const llama_token_data_array & cur_p,
-                                  diffusion_algorithm algorithm,
-                                  std::mt19937 & rng) {
-    switch (algorithm) {
-        case CONFIDENCE_BASED:
-            return cur_p.data[cur_p.selected].p;
-        case ENTROPY_BASED: {
-            float entropy = 0.0f;
-            const float epsilon = 1e-10f;
-            for (size_t i = 0; i < cur_p.size; i++) {
-                float prob = cur_p.data[i].p;
-                entropy += prob * logf(prob + epsilon);
-            }
-            return -entropy;
-        }
-        case MARGIN_BASED:
-            return (cur_p.size > 1) ? cur_p.data[0].p - cur_p.data[1].p : cur_p.data[0].p;
-        case RANDOM: {
-            std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
-            return uniform(rng);
-        }
-        case ORIGIN:
-            return cur_p.data[cur_p.selected].p;
-        default:
-            return 0.0f;
-    }
-}
-
-static int32_t calculate_transfer_count(int32_t step, int32_t total_steps, 
-                                        int32_t remaining_masked, float eps) {
-    float t = 1.0f - (float)step / total_steps * (1.0f - eps);
-    float s = 1.0f - (float)(step + 1) / total_steps * (1.0f - eps);
-    float p_transfer = (step < total_steps - 1) ? (1.0f - s / t) : 1.0f;
-    return (int32_t)(remaining_masked * p_transfer);
-}
-
-// 基于examples/diffusion/diffusion-cli.cpp的扩散生成实现
-static int diffusion_generate(
-    llama_context* ctx,
-    const llama_token* input_tokens,
-    llama_token* output_tokens,
-    int32_t n_input,
-    const diffusion_params& params,
-    int32_t& n_generated
-) {
-    SRV_INF("+ diffusion_generate: Starting diffusion generation with %d steps\n", params.steps);
-    
+// Complete diffusion_generate function implementation
+static void diffusion_generate(llama_context *          ctx,
+                               const llama_token *      input_tokens,
+                               llama_token *            output_tokens,
+                               int32_t                  n_input,
+                               const diffusion_params & params,
+                               int32_t &                n_generated) {
     n_generated = 0;
     if (!ctx || !input_tokens || !output_tokens || n_input <= 0 || params.max_length <= n_input) {
-        return -1;
+        return;
     }
 
     const llama_model * model = llama_get_model(ctx);
-    const llama_vocab * vocab = llama_model_get_vocab(model);
-    
-    // Initialize with input and pad with mask tokens  
+
+    // Initialize with input and pad with mask tokens
     std::copy(input_tokens, input_tokens + n_input, output_tokens);
     std::fill(output_tokens + n_input, output_tokens + params.max_length, params.mask_token_id);
 
     std::mt19937 rng(params.seed);
+
     llama_set_causal_attn(ctx, false);
 
-    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
-    SRV_INF("diffusion_generate: n_vocab = %d\n", n_vocab);
+    int32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+
     std::vector<llama_token_data> candidates(n_vocab);
+    std::vector<llama_token_data> conf_candidates;
+    conf_candidates.reserve(params.max_length);
     std::vector<int32_t> mask_positions;
     mask_positions.reserve(params.max_length);
 
@@ -4597,129 +4352,412 @@ static int diffusion_generate(
     }
     llama_sampler_chain_add(sampler, llama_sampler_init_dist(params.seed));
 
-    // Decode in micro-batches to satisfy encoder constraint: n_ubatch >= n_tokens
-    const int32_t n_ubatch = llama_n_ubatch(ctx);
-    llama_batch batch = llama_batch_init(std::max(1, n_ubatch), 0, 1);
-    // Buffer to hold logits for all positions in the sequence for this step
-    std::vector<float> logits_all;
-    logits_all.resize((size_t)params.max_length * (size_t)n_vocab);
+    struct llama_sampler * dist_sampler = llama_sampler_init_dist(params.seed);
 
-    // Diffusion steps
-    for (int32_t step = 0; step < params.steps; step++) {
-        SRV_INF("diffusion_generate Diffusion step %d/%d\n", step + 1, params.steps);
-        if (params.step_callback) {
-            if (!params.step_callback(step, params.steps, output_tokens, params.max_length, params.step_callback_user_data)) {
-                break;
+    llama_batch batch = llama_batch_init(params.max_length, 0, 1);
+    batch.n_tokens    = params.max_length;
+
+    // Pre-allocate buffers for CFG if needed
+    int32_t                  logits_size = n_vocab * params.max_length;
+    std::vector<float>       cond_logits_buffer;
+    std::vector<llama_token> un_x_buffer;
+    if (params.cfg_scale > 0.0f) {
+        cond_logits_buffer.resize(logits_size);
+        un_x_buffer.resize(params.max_length);
+    }
+
+    // For block-based processing
+    std::vector<int32_t> num_transfer_tokens;
+    int32_t              num_blocks      = 1;
+    int32_t              steps_per_block = params.steps;
+
+    if (params.schedule == BLOCK_BASED) {
+        GGML_ASSERT(params.max_length % params.block_length == 0);
+        num_blocks = params.max_length / params.block_length;
+        GGML_ASSERT(params.steps % num_blocks == 0);
+        steps_per_block = params.steps / num_blocks;
+    }
+
+    int64_t total_sampling_time = 0;
+    int64_t total_time          = 0;
+    int64_t time_start          = ggml_time_us();
+
+    for (int block_num = 0; block_num < num_blocks; block_num++) {
+        int32_t block_start = (params.schedule == BLOCK_BASED) ? n_input + block_num * params.block_length : 0;
+        int32_t block_end   = (params.schedule == BLOCK_BASED) ?
+                                  std::min(n_input + (block_num + 1) * params.block_length, params.max_length) :
+                                  params.max_length;
+
+        // Count masked tokens in current block for block-based processing
+        if (params.schedule == BLOCK_BASED) {
+            int32_t block_mask_count = 0;
+            for (int i = block_start; i < block_end; i++) {
+                if (output_tokens[i] == params.mask_token_id) {
+                    block_mask_count++;
+                }
             }
+            num_transfer_tokens = get_num_transfer_tokens(block_mask_count, steps_per_block);
         }
 
-        // Evaluate in chunks of at most n_ubatch tokens and collect logits per position
-        for (int32_t start = 0; start < params.max_length; start += n_ubatch) {
-            const int32_t chunk = std::min(n_ubatch, params.max_length - start);
-            batch.n_tokens = chunk;
+        for (int32_t step = 0; step < steps_per_block; step++) {
+            int32_t global_step = block_num * steps_per_block + step;
 
-            for (int32_t i = 0; i < chunk; i++) {
-                const int32_t pos = start + i;
-                batch.token[i]     = output_tokens[pos];
-                batch.pos[i]       = pos;
+            if (params.step_callback) {
+                if (!params.step_callback(
+                        global_step, params.steps, output_tokens, params.max_length, params.step_callback_user_data)) {
+                    break;
+                }
+            }
+
+            // Setup batch
+            for (int32_t i = 0; i < params.max_length; i++) {
+                batch.token[i]     = output_tokens[i];
+                batch.pos[i]       = i;
                 batch.n_seq_id[i]  = 1;
                 batch.seq_id[i][0] = 0;
                 batch.logits[i]    = 1;
             }
 
-            int ret = llama_decode(ctx, batch);
-            if (ret != 0) {
-                SRV_ERR("Failed to decode at step %d (chunk start %d, size %d), ret = %d\n", step, start, chunk, ret);
+            float * logits = nullptr;
+
+            if (params.cfg_scale > 0.0f) {
+                int ret = llama_decode(ctx, batch);
+                if (ret != 0) {
+                    SRV_ERR("%s", "Failed to generate conditional\n");
+                    break;
+                }
+                float * cond_logits_ptr = llama_get_logits(ctx);
+                std::memcpy(cond_logits_buffer.data(), cond_logits_ptr, logits_size * sizeof(float));
+
+                // Unconditional generation (mask input)
+                std::copy(output_tokens, output_tokens + params.max_length, un_x_buffer.begin());
+                for (int32_t i = 0; i < n_input; i++) {
+                    un_x_buffer[i] = params.mask_token_id;
+                }
+
+                for (int32_t i = 0; i < params.max_length; i++) {
+                    batch.token[i] = un_x_buffer[i];
+                }
+                ret = llama_decode(ctx, batch);
+                if (ret != 0) {
+                    SRV_ERR("%s", "Failed to generate unconditional\n");
+                    break;
+                }
+                float * uncond_logits = llama_get_logits(ctx);
+
+                // Apply CFG
+                for (int32_t i = 0; i < logits_size; i++) {
+                    cond_logits_buffer[i] =
+                        uncond_logits[i] + (params.cfg_scale + 1.0f) * (cond_logits_buffer[i] - uncond_logits[i]);
+                }
+                logits = cond_logits_buffer.data();
+            } else {
+                int ret = llama_decode(ctx, batch);
+                if (ret != 0) {
+                    SRV_ERR("failed to decode at step %d, ret = %d\n", global_step, ret);
+                    break;
+                }
+                logits = llama_get_logits(ctx);
+            }
+
+            if (!logits) {
+                SRV_ERR("failed to get logits at step %d\n", global_step);
                 break;
             }
 
-            // Copy logits for each token in this chunk into logits_all at the absolute position
-            for (int32_t i = 0; i < chunk; i++) {
-                const float * li = llama_get_logits_ith(ctx, i);
-                if (!li) {
-                    SRV_ERR("Failed to get logits at step %d for index %d in chunk start %d\n", step, i, start);
-                    break;
+            auto get_logits_for_pos = [&](int32_t pos) -> const float * {
+                if (params.shift_logits) {
+                    return pos == 0 ? logits : logits + (pos - 1) * n_vocab;
                 }
-                const size_t dst_offset = (size_t)(start + i) * (size_t)n_vocab;
-                std::memcpy(&logits_all[dst_offset], li, (size_t)n_vocab * sizeof(float));
-            }
-        }
-
-        // Find mask positions
-        mask_positions.clear();
-        for (int32_t i = 0; i < params.max_length; i++) {
-            if (output_tokens[i] == params.mask_token_id) {
-                mask_positions.push_back(i);
-            }
-        }
-
-        if (mask_positions.empty()) {
-            break;
-        }
-
-        // Sample tokens for each masked position and calculate confidences
-        std::vector<std::pair<float, int32_t>> confidences;
-        std::vector<llama_token> sampled_tokens(mask_positions.size());
-
-        for (size_t i = 0; i < mask_positions.size(); i++) {
-            int32_t pos = mask_positions[i];
-            const float * pos_logits = &logits_all[(size_t)pos * (size_t)n_vocab];
-
-            for (int32_t token_id = 0; token_id < n_vocab; token_id++) {
-                candidates[token_id].logit = pos_logits[token_id];
-                candidates[token_id].p = 0.0f;
-                candidates[token_id].id = token_id;
-            }
-
-            llama_token_data_array cur_p = {
-                candidates.data(),
-                candidates.size(),
-                -1,
-                false,
+                return logits + (pos) * n_vocab;
             };
 
-            llama_sampler_apply(sampler, &cur_p);
-            llama_token sampled_token = cur_p.data[cur_p.selected].id;
+            int64_t time_start_sampling = ggml_time_us();
 
-            float conf = calculate_confidence(cur_p, params.algorithm, rng);
-
-            sampled_tokens[i] = sampled_token;
-            confidences.emplace_back(conf, i);
-        }
-
-        // Calculate how many tokens to transfer in this step
-        int32_t transfer_count = calculate_transfer_count(step, params.steps, mask_positions.size(), params.eps);
-
-        if (transfer_count > 0) {
-            // Sort by confidence (highest first)
-            std::partial_sort(confidences.begin(),
-                             confidences.begin() + std::min(transfer_count, (int32_t)confidences.size()),
-                             confidences.end(),
-                             [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
-                                 return a.first > b.first;
-                             });
-
-            // Transfer the most confident tokens
-            for (int32_t i = 0; i < std::min(transfer_count, (int32_t)confidences.size()); i++) {
-                int32_t mask_idx = confidences[i].second;
-                int32_t pos = mask_positions[mask_idx];
-                output_tokens[pos] = sampled_tokens[mask_idx];
+            mask_positions.clear();
+            for (int32_t i = 0; i < params.max_length; i++) {
+                if (output_tokens[i] == params.mask_token_id) {
+                    // For block-based, only consider current block
+                    if (params.schedule != BLOCK_BASED || (i >= block_start && i < block_end)) {
+                        mask_positions.push_back(i);
+                    }
+                }
             }
+
+            if (mask_positions.empty()) {
+                break;
+            }
+
+            if (params.add_gumbel_noise && params.alg_temp > 0.0f) {
+                add_gumbel_noise(logits, n_vocab, params.alg_temp, rng);
+            }
+
+            if (params.algorithm == ORIGIN) {
+                int32_t transfer_count = calculate_transfer_count(
+                    step, steps_per_block, mask_positions.size(), params.schedule, params.eps, num_transfer_tokens);
+                float p_transfer = (float) transfer_count / mask_positions.size();
+
+                for (int32_t pos : mask_positions) {
+                    if (std::uniform_real_distribution<float>(0.0f, 1.0f)(rng) < p_transfer) {
+                        const float * pos_logits = get_logits_for_pos(pos);
+                        for (int32_t token_id = 0; token_id < n_vocab; token_id++) {
+                            candidates[token_id].id    = token_id;
+                            candidates[token_id].logit = pos_logits[token_id];
+                            candidates[token_id].p     = 0.0f;
+                        }
+
+                        llama_token_data_array cur_p = {
+                            candidates.data(),
+                            (size_t) n_vocab,
+                            -1,
+                            false,
+                        };
+
+                        llama_sampler_apply(sampler, &cur_p);
+                        output_tokens[pos] = cur_p.data[cur_p.selected].id;
+                    }
+                }
+            } else {
+                std::vector<std::pair<float, int32_t>> confidences;
+                std::vector<llama_token>               sampled_tokens(mask_positions.size());
+
+                for (size_t i = 0; i < mask_positions.size(); i++) {
+                    int32_t       pos        = mask_positions[i];
+                    const float * pos_logits = get_logits_for_pos(pos);
+
+                    for (int32_t token_id = 0; token_id < n_vocab; token_id++) {
+                        candidates[token_id].logit = pos_logits[token_id];
+                        candidates[token_id].p     = 0.0f;
+                        candidates[token_id].id    = token_id;
+                    }
+
+                    llama_token_data_array cur_p = {
+                        candidates.data(),
+                        candidates.size(),
+                        -1,
+                        false,
+                    };
+
+                    llama_sampler_apply(sampler, &cur_p);
+                    llama_token sampled_token = cur_p.data[cur_p.selected].id;
+
+                    float conf = calculate_confidence(cur_p, params.algorithm, rng);
+
+                    sampled_tokens[i] = sampled_token;
+                    confidences.emplace_back(conf, i);
+                }
+
+                int32_t transfer_count = calculate_transfer_count(
+                    step, steps_per_block, mask_positions.size(), params.schedule, params.eps, num_transfer_tokens);
+
+                if (transfer_count > 0) {
+                    if (params.alg_temp == 0.0f) {
+                        std::partial_sort(confidences.begin(),
+                                          confidences.begin() + std::min(transfer_count, (int32_t) confidences.size()),
+                                          confidences.end(),
+                                          [](const std::pair<float, int32_t> & a, const std::pair<float, int32_t> & b) {
+                                              if (a.first != b.first) {
+                                                  return a.first > b.first;
+                                              }
+                                              return a.second < b.second;
+                                          });
+
+                        for (int32_t i = 0; i < std::min(transfer_count, (int32_t) confidences.size()); i++) {
+                            int32_t mask_idx   = confidences[i].second;
+                            int32_t pos        = mask_positions[mask_idx];
+                            output_tokens[pos] = sampled_tokens[mask_idx];
+                        }
+                    } else {
+                        conf_candidates.clear();
+                        for (size_t i = 0; i < confidences.size(); i++) {
+                            float conf_logit = confidences[i].first / params.alg_temp;
+                            conf_candidates.emplace_back(llama_token_data{ (int32_t) i, conf_logit, 0.0f });
+                        }
+
+                        llama_token_data_array conf_array = {
+                            conf_candidates.data(),
+                            conf_candidates.size(),
+                            -1,
+                            false,
+                        };
+
+                        for (int32_t i = 0; i < std::min(transfer_count, (int32_t) confidences.size()); i++) {
+                            llama_sampler_apply(dist_sampler, &conf_array);
+                            int32_t selected_idx = conf_array.selected;
+                            int32_t mask_idx     = selected_idx;
+                            int32_t pos          = mask_positions[mask_idx];
+                            output_tokens[pos]   = sampled_tokens[mask_idx];
+
+                            conf_candidates[selected_idx].p = 0.0f;
+                            conf_array.selected             = -1;
+                        }
+                    }
+                }
+            }
+
+            int64_t time_end_sampling = ggml_time_us();
+            total_sampling_time += time_end_sampling - time_start_sampling;
         }
     }
 
-    // Count generated tokens (excluding mask tokens)
-    for (int32_t i = n_input; i < params.max_length; i++) {
-        if (output_tokens[i] != params.mask_token_id) {
-            n_generated++;
-        }
-    }
+    int64_t time_end = ggml_time_us();
+    total_time += time_end - time_start;
 
-    llama_sampler_free(sampler);
+    SRV_INF("\ntotal time: %0.2fms, time per step: %0.2fms, sampling time per step: %0.2fms\n",
+            total_time / 1000.0,
+            total_time / 1000.0 / params.steps,
+            total_sampling_time / 1000.0 / params.steps);
+
     llama_batch_free(batch);
-    
-    SRV_INF("- Diffusion generation completed, generated %d tokens\n", n_generated);
-    return 0;
+    llama_sampler_free(sampler);
+    llama_sampler_free(dist_sampler);
+
+    n_generated = params.max_length;
+}
+
+// Diffusion algorithm implementations
+static float calculate_confidence(const llama_token_data_array & cur_p,
+                                  diffusion_algorithm            algorithm,
+                                  std::mt19937 &                 rng) {
+    switch (algorithm) {
+        case CONFIDENCE_BASED:
+            return cur_p.data[cur_p.selected].p;  // Selected token probability
+
+        case ENTROPY_BASED:
+            {
+                float       entropy = 0.0f;
+                const float epsilon = 1e-10f;
+                for (size_t i = 0; i < cur_p.size; i++) {
+                    float prob = cur_p.data[i].p;
+                    entropy += prob * logf(prob + epsilon);
+                }
+                return -entropy;  // Higher entropy = lower confidence
+            }
+
+        case MARGIN_BASED:
+            return (cur_p.size > 1) ? cur_p.data[0].p - cur_p.data[1].p : cur_p.data[0].p;
+
+        case RANDOM:
+            {
+                std::uniform_real_distribution<float> uniform(0.0f, 1.0f);
+                return uniform(rng);  // Random confidence
+            }
+
+        case ORIGIN:
+            return cur_p.data[cur_p.selected].p;
+
+        default:
+            return 0.0f;
+    }
+}
+
+// Unified transfer count calculation function
+static int32_t calculate_transfer_count(int32_t                      step,
+                                        int32_t                      total_steps,
+                                        int32_t                      remaining_masked,
+                                        transfer_schedule            schedule,
+                                        float                        eps,
+                                        const std::vector<int32_t> & num_transfer_tokens) {
+    switch (schedule) {
+        case TIMESTEP_BASED:
+            {
+                float t          = 1.0f - (float) step / total_steps * (1.0f - eps);
+                float s          = 1.0f - (float) (step + 1) / total_steps * (1.0f - eps);
+                float p_transfer = (step < total_steps - 1) ? (1.0f - s / t) : 1.0f;
+                return (int32_t) (remaining_masked * p_transfer);
+            }
+
+        case BLOCK_BASED:
+            if (!num_transfer_tokens.empty() && step < (int32_t) num_transfer_tokens.size()) {
+                return num_transfer_tokens[step];
+            }
+            return remaining_masked / (total_steps - step);  // Fallback
+
+        default:
+            return remaining_masked / (total_steps - step);
+    }
+}
+
+static bool diffusion_step_callback(int32_t             step,
+                                    int32_t             total_steps,
+                                    const llama_token * tokens,
+                                    int32_t             n_tokens,
+                                    void *              user_data) {
+    (void) user_data;
+
+    callback_data * data = static_cast<callback_data *>(user_data);
+
+    auto print_progress_bar = [](int32_t step, int32_t total_steps) {
+        int progress_percent = (step * 100) / total_steps;
+        int progress_bars    = (step * 50) / total_steps;
+        SRV_INF("\rdiffusion step: %d/%d [%s%s] %d%%\n",
+                step,
+                total_steps,
+                std::string(progress_bars, '=').c_str(),
+                std::string(50 - progress_bars, ' ').c_str(),
+                progress_percent);
+    };
+
+    if (data->diff_params->visual_mode) {
+        // Visual mode: clear
+        SRV_INF("%s", "\033[2J\033[H");  // Clear screen and move cursor to top-left
+
+        print_progress_bar(step, total_steps);
+
+        SRV_INF("%s", "\n");
+
+        std::string current_text = " ";
+
+        for (int32_t i = data->n_input; i < n_tokens; i++) {
+            std::string token_str;
+            if (tokens[i] != llama_vocab_mask(data->vocab)) {
+                char piece[256];
+                int  n_chars = llama_token_to_piece(data->vocab, tokens[i], piece, sizeof(piece), 0, false);
+                if (n_chars > 0) {
+                    piece[n_chars] = '\0';
+                    token_str      = piece;
+                }
+            } else {
+                token_str = " ";
+            }
+
+            current_text += token_str;
+        }
+
+        SRV_INF("%s\n", current_text.c_str());
+    } else {
+        print_progress_bar(step, total_steps);
+    }
+
+    return true;
+}
+
+static void add_gumbel_noise(float * logits, int32_t n_vocab, float temperature, std::mt19937 & rng) {
+    if (temperature == 0.0f) {
+        return;
+    }
+
+    std::uniform_real_distribution<double> uniform(0.0, 1.0);
+    for (int32_t i = 0; i < n_vocab; i++) {
+        double noise        = uniform(rng);
+        // Prevent log(0)
+        noise               = std::max(noise, 1e-20);
+        double gumbel_noise = std::pow(-std::log(noise), temperature);
+        logits[i]           = std::exp(logits[i]) / gumbel_noise;
+    }
+}
+
+static std::vector<int32_t> get_num_transfer_tokens(int32_t mask_count, int32_t steps) {
+    std::vector<int32_t> num_transfer_tokens(steps);
+
+    int32_t base      = mask_count / steps;
+    int32_t remainder = mask_count % steps;
+
+    for (int32_t i = 0; i < steps; i++) {
+        num_transfer_tokens[i] = base + (i < remainder ? 1 : 0);
+    }
+
+    return num_transfer_tokens;
 }
 
 int main(int argc, char ** argv) {
@@ -5248,7 +5286,7 @@ int main(int argc, char ** argv) {
             const std::function<bool()> & is_connection_closed,
             httplib::Response & res,
             oaicompat_type oaicompat) -> void {
-        GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL);
+        GGML_ASSERT(type == SERVER_TASK_TYPE_COMPLETION || type == SERVER_TASK_TYPE_INFILL || type == SERVER_TASK_TYPE_DIFFUSION);
 
         auto completion_id = gen_chatcmplid();
         std::unordered_set<int> task_ids;
@@ -5275,23 +5313,6 @@ int main(int argc, char ** argv) {
                 server_task task = server_task(type);
 
                 task.id    = ctx_server.queue_tasks.get_new_id();
-                // 检查是否为扩散模型任务
-                if (ctx_server.model_type == ModelTypeDetector::ModelType::DIFFUSION &&
-                    type == SERVER_TASK_TYPE_COMPLETION) {
-
-                    task.is_diffusion_task = true;
-
-                    // 解析扩散专用参数
-                    try {
-                        parse_diffusion_params(data, task.diff_params);
-                    } catch (const std::exception& e) {
-                        res_error(res, format_error_response(
-                            "Invalid diffusion parameters: " + std::string(e.what()),
-                            ERROR_TYPE_INVALID_REQUEST));
-                        return;
-                    }
-                }
-
                 task.index = i;
 
                 task.prompt_tokens    = std::move(inputs[i]);
@@ -5304,7 +5325,8 @@ int main(int argc, char ** argv) {
                 // OAI-compat
                 task.params.oaicompat                 = oaicompat;
                 task.params.oaicompat_cmpl_id         = completion_id;
-                // oaicompat_model is already populated by params_from_json_cmpl                
+                // oaicompat_model is already populated by params_from_json_cmpl
+
                 tasks.push_back(std::move(task));
             }
 
@@ -5388,8 +5410,17 @@ int main(int argc, char ** argv) {
     const auto handle_completions_oai = [&handle_completions_impl](const httplib::Request & req, httplib::Response & res) {
         json data = oaicompat_completion_params_parse(json::parse(req.body));
         std::vector<raw_buffer> files; // dummy
+        
+        // Check if this is a diffusion request by looking for diffusion-specific parameters
+        bool is_diffusion = data.contains("diffusion_steps") || 
+                           data.contains("diffusion_algorithm") || 
+                           data.contains("cfg_scale") ||
+                           data.contains("visual_mode");
+        
+        server_task_type task_type = is_diffusion ? SERVER_TASK_TYPE_DIFFUSION : SERVER_TASK_TYPE_COMPLETION;
+        
         handle_completions_impl(
-            SERVER_TASK_TYPE_COMPLETION,
+            task_type,
             data,
             files,
             req.is_connection_closed,
