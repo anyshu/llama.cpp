@@ -720,6 +720,8 @@ struct callback_data {
     diffusion_params *  diff_params;
     const llama_vocab * vocab;
     int32_t             n_input;
+    void *              slot;           // For streaming updates (server_slot*)
+    void *              ctx_server;     // For sending partial responses (server_context*)
 };
 
 // Forward declarations for diffusion functions
@@ -910,6 +912,7 @@ struct swa_checkpoint {
     std::vector<uint8_t> data;
 };
 
+//last output chunk, sent when the generation is finished
 struct server_task_result_cmpl_final : server_task_result {
     int index = 0;
 
@@ -4035,7 +4038,7 @@ struct server_context {
                         
                         // Set up callback
                         const auto & prompt_text_tokens = slot.prompt_tokens.get_text_tokens();
-                        callback_data cb_data = { &diff_params, vocab, (int32_t)prompt_text_tokens.size() };
+                        callback_data cb_data = { &diff_params, vocab, (int32_t)prompt_text_tokens.size(), &slot, this };
                         diff_params.step_callback = diffusion_step_callback;
                         diff_params.step_callback_user_data = &cb_data;
 
@@ -4074,6 +4077,20 @@ struct server_context {
                             
                             slot.generated_text = output_text;
                             slot.generated_tokens = filtered_tokens;
+                            
+                            // For streaming mode, send the complete text as a single chunk before the final response
+                            if (slot.params.stream && !output_text.empty()) {
+                                completion_token_output result;
+                                result.tok = -1; // No specific token for diffusion output
+                                result.text_to_send = output_text;
+                                result.prob = 1.0f;
+                                
+                                slot.n_decoded = filtered_tokens.size();
+                                slot.has_next_token = false;
+                                slot.stop = STOP_TYPE_LIMIT;
+                                
+                                send_partial_response(slot, result, false);
+                            }
                             
                             send_final_response(slot);
                         } else {
@@ -4683,9 +4700,30 @@ static bool diffusion_step_callback(int32_t             step,
                                     const llama_token * tokens,
                                     int32_t             n_tokens,
                                     void *              user_data) {
-    (void) user_data;
-
     callback_data * data = static_cast<callback_data *>(user_data);
+
+    SRV_INF("%s", "\033[2J\033[H");
+    SRV_INF("diffusion_step_callback ENTRY: step=%d/%d, n_tokens=%d, n_input=%d, expected_range=%d\n",
+            step, total_steps, n_tokens, data->n_input, data->diff_params->max_length);
+    
+    // Debug: Print first few tokens to see what's in the array
+    std::string current_text = "Token array sample (first 20 after input): ";
+    for (int32_t i = data->n_input; i < n_tokens; i++) {
+        std::string token_str;
+        if (tokens[i] != llama_vocab_mask(data->vocab)) {
+            char piece[256];
+            int  n_chars = llama_token_to_piece(data->vocab, tokens[i], piece, sizeof(piece), 0, false);
+            if (n_chars > 0) {
+                piece[n_chars] = '\0';
+                token_str      = piece;
+            }
+        } else {
+            token_str = "_"; // Represent mask token as "_"
+        }
+
+        current_text += token_str;
+    }
+    SRV_INF("%s\n", current_text.c_str());
 
     auto print_progress_bar = [](int32_t step, int32_t total_steps) {
         int progress_percent = (step * 100) / total_steps;
@@ -4697,36 +4735,52 @@ static bool diffusion_step_callback(int32_t             step,
                 std::string(50 - progress_bars, ' ').c_str(),
                 progress_percent);
     };
+   
+    // Count mask and real tokens for debug logging
+    llama_token mask_token = llama_vocab_mask(data->vocab);
+    int32_t mask_count = 0;
+    int32_t real_token_count = 0;
+    for (int32_t i = data->n_input; i < n_tokens; i++) {
+        if (tokens[i] == mask_token) {
+            mask_count++;
+        } else {
+            real_token_count++;
+        }
+    }
 
     if (data->diff_params->visual_mode) {
-        // Visual mode: clear
-        SRV_INF("%s", "\033[2J\033[H");  // Clear screen and move cursor to top-left
-
+        // Visual mode: clear screen
+        // SRV_INF("%s", "\033[2J\033[H");
         print_progress_bar(step, total_steps);
-
-        SRV_INF("%s", "\n");
-
-        std::string current_text = " ";
-
-        for (int32_t i = data->n_input; i < n_tokens; i++) {
-            std::string token_str;
-            if (tokens[i] != llama_vocab_mask(data->vocab)) {
-                char piece[256];
-                int  n_chars = llama_token_to_piece(data->vocab, tokens[i], piece, sizeof(piece), 0, false);
-                if (n_chars > 0) {
-                    piece[n_chars] = '\0';
-                    token_str      = piece;
-                }
-            } else {
-                token_str = " ";
-            }
-
-            current_text += token_str;
-        }
-
-        SRV_INF("%s\n", current_text.c_str());
+        SRV_INF("\n%s\n", current_text.c_str());
     } else {
         print_progress_bar(step, total_steps);
+    }
+
+    // Send streaming update if slot is available and streaming is enabled
+    server_slot * slot = static_cast<server_slot*>(data->slot);
+    server_context * ctx_server = static_cast<server_context*>(data->ctx_server);
+    
+    SRV_DBG("diffusion_step_callback: step=%d/%d, mask=%d, real=%d, stream=%d, text_len=%zu\n",
+            step, total_steps, mask_count, real_token_count,
+            (slot && slot->params.stream) ? 1 : 0,
+            current_text.length());
+    
+    if (slot && ctx_server && slot->params.stream) {
+        // Send progress update more frequently to show diffusion process
+        const int update_interval = std::max(1, total_steps / 50); // Send ~50 updates
+        if (step % update_interval == 0 || step == total_steps - 1) {
+            SRV_INF("Sending diffusion update: step=%d, interval=%d, first_100_chars='%.100s...'\n",
+                    step, update_interval, current_text.c_str());
+            
+            completion_token_output progress_token;
+            progress_token.tok = -1; // Special value for progress
+            progress_token.text_to_send = current_text;
+            progress_token.prob = 1.0f;
+            
+            // Use is_progress=false to send actual content instead of progress info
+            ctx_server->send_partial_response(*slot, progress_token, false);
+        }
     }
 
     return true;
