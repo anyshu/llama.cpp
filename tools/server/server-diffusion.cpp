@@ -4707,7 +4707,7 @@ static bool diffusion_step_callback(int32_t             step,
             step, total_steps, n_tokens, data->n_input, data->diff_params->max_length);
     
     // Debug: Print first few tokens to see what's in the array
-    std::string current_text = "Token array sample (first 20 after input): ";
+    std::string current_text = "";//"Token array sample (first 20 after input): ";
     for (int32_t i = data->n_input; i < n_tokens; i++) {
         std::string token_str;
         if (tokens[i] != llama_vocab_mask(data->vocab)) {
@@ -4723,7 +4723,7 @@ static bool diffusion_step_callback(int32_t             step,
 
         current_text += token_str;
     }
-    SRV_INF("%s\n", current_text.c_str());
+    // SRV_INF("%s\n", current_text.c_str());
 
     auto print_progress_bar = [](int32_t step, int32_t total_steps) {
         int progress_percent = (step * 100) / total_steps;
